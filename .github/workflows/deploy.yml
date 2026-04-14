@@ -1,0 +1,253 @@
+name: Docker Deployment to AWS Lightsail
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── 1. Load config & provision instance ───────────────────────────────────
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      instance_name: ${{ steps.config.outputs.instance_name }}
+      static_ip: ${{ steps.config.outputs.static_ip }}
+      aws_region: ${{ steps.config.outputs.aws_region }}
+      app_name: ${{ steps.config.outputs.app_name }}
+      app_version: ${{ steps.config.outputs.app_version }}
+      should_deploy: ${{ steps.config.outputs.should_deploy }}
+      os_type: ${{ steps.config.outputs.os_type }}
+      package_manager: ${{ steps.config.outputs.package_manager }}
+      verification_port: ${{ steps.config.outputs.verification_port }}
+      verification_path: ${{ steps.config.outputs.verification_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache deployment scripts
+        id: cache-scripts
+        uses: actions/cache@v4
+        with:
+          path: workflows
+          key: deploy-scripts-${{ github.sha }}
+          restore-keys: deploy-scripts-
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+          role-duration-seconds: 900
+          aws-region: us-east-1
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-boto3-pyyaml-${{ runner.os }}
+
+      - name: Setup Python
+        run: python3 -m pip install --quiet boto3 pyyaml
+
+      - name: Setup instance
+        id: config
+        run: |
+          export PYTHONPATH="${PYTHONPATH}:$(pwd)/workflows"
+          python3 workflows/setup_instance.py
+
+  # ─── 2. Package the application ────────────────────────────────────────────
+  package:
+    needs: setup
+    runs-on: ubuntu-latest
+    if: needs.setup.outputs.should_deploy == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create deployment package
+        run: |
+          python3 << 'EOF'
+          import yaml, os, subprocess
+
+          with open('deployment-docker.config.yml') as f:
+              config = yaml.safe_load(f)
+
+          package_files = config.get('application', {}).get('package_files', [])
+          existing = [f for f in package_files if os.path.exists(f)]
+
+          if existing:
+              cmd = ['tar', '-czf', 'app.tar.gz'] + existing
+          else:
+              cmd = ['tar', '-czf', 'app.tar.gz',
+                     '--exclude=.git', '--exclude=.github',
+                     '--exclude=node_modules', '--exclude=*.tar.gz', '.']
+
+          r = subprocess.run(cmd, capture_output=True, text=True)
+          if r.returncode not in [0, 1]:
+              print(r.stderr); exit(r.returncode)
+          print("✅ Package created")
+          EOF
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-app-package
+          path: app.tar.gz
+          retention-days: 1
+
+  # ─── 3. Install Docker on instance ─────────────────────────────────────────
+  pre-deploy:
+    needs: [setup, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: needs.setup.outputs.should_deploy == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore deployment scripts
+        uses: actions/cache@v4
+        with:
+          path: workflows
+          key: deploy-scripts-${{ github.sha }}
+          restore-keys: deploy-scripts-
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+          role-duration-seconds: 900
+          aws-region: ${{ needs.setup.outputs.aws_region }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-boto3-pyyaml-${{ runner.os }}
+
+      - name: Setup Python
+        run: python3 -m pip install --quiet boto3 pyyaml
+
+      - name: Install Docker on instance
+        run: |
+          export GITHUB_ACTIONS=true
+          export PYTHONPATH="${PYTHONPATH}:$(pwd)/workflows"
+          python3 workflows/deploy-pre-steps.py \
+            --instance-name ${{ needs.setup.outputs.instance_name }} \
+            --region ${{ needs.setup.outputs.aws_region }} \
+            --config-file deployment-docker.config.yml
+
+  # ─── 4. Deploy Docker app ───────────────────────────────────────────────────
+  deploy:
+    needs: [setup, pre-deploy, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: needs.setup.outputs.should_deploy == 'true' && needs.pre-deploy.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore deployment scripts
+        uses: actions/cache@v4
+        with:
+          path: workflows
+          key: deploy-scripts-${{ github.sha }}
+          restore-keys: deploy-scripts-
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+          role-duration-seconds: 900
+          aws-region: ${{ needs.setup.outputs.aws_region }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-boto3-pyyaml-${{ runner.os }}
+
+      - name: Setup Python
+        run: python3 -m pip install --quiet boto3 pyyaml
+
+      - name: Download package
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-app-package
+
+      - name: Deploy Docker application
+        run: |
+          export GITHUB_ACTIONS=true
+          export PYTHONPATH="${PYTHONPATH}:$(pwd)/workflows"
+          python3 workflows/deploy-post-steps.py \
+            app.tar.gz \
+            --instance-name ${{ needs.setup.outputs.instance_name }} \
+            --region ${{ needs.setup.outputs.aws_region }} \
+            --config-file deployment-docker.config.yml \
+            --verify --cleanup \
+            --env GITHUB_SHA=${{ github.sha }} \
+            --env GITHUB_REF=${{ github.ref_name }} \
+            --env GITHUB_ACTOR=${{ github.actor }}
+
+  # ─── 5. Verify deployment ───────────────────────────────────────────────────
+  verify:
+    needs: [setup, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    outputs:
+      app_url: ${{ steps.outputs.outputs.app_url }}
+      status: ${{ steps.check.outputs.status }}
+    steps:
+      - name: Check HTTP response
+        id: check
+        run: |
+          PORT="${{ needs.setup.outputs.verification_port }}"
+          PATH_="${{ needs.setup.outputs.verification_path }}"
+          IP="${{ needs.setup.outputs.static_ip }}"
+          URL="http://${IP}:${PORT}${PATH_}"
+          echo "📍 Verifying: $URL"
+
+          echo "⏳ Waiting 30s for containers to initialize..."
+          sleep 30
+
+          for i in {1..10}; do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 8 --max-time 20 "$URL" || echo "000")
+            echo "Attempt $i/10: HTTP $HTTP"
+            if [ "$HTTP" = "200" ]; then
+              echo "✅ Application is responding"
+              echo "status=success" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "status=failed" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Set outputs
+        id: outputs
+        if: always()
+        run: |
+          PORT="${{ needs.setup.outputs.verification_port }}"
+          IP="${{ needs.setup.outputs.static_ip }}"
+          if [ "$PORT" = "80" ]; then
+            echo "app_url=http://${IP}/" >> $GITHUB_OUTPUT
+          else
+            echo "app_url=http://${IP}:${PORT}/" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "## 🐳 Docker Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **App**: ${{ needs.setup.outputs.app_name }} v${{ needs.setup.outputs.app_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ steps.check.outputs.status || 'failed' }}" >> $GITHUB_STEP_SUMMARY
+          PORT="${{ needs.setup.outputs.verification_port }}"
+          IP="${{ needs.setup.outputs.static_ip }}"
+          if [ "$PORT" = "80" ]; then
+            echo "- **URL**: http://${IP}/" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **URL**: http://${IP}:${PORT}/" >> $GITHUB_STEP_SUMMARY
+          fi

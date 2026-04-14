@@ -1,0 +1,52 @@
+# Docker Deployment Configuration for AWS Lightsail
+# Only Docker-based deployments are supported in this repo.
+
+aws:
+  region: us-east-1
+
+lightsail:
+  instance_name: my-docker-app
+  # bundle_id: medium_3_0  # Uncomment to override. Default: medium_3_0 (4GB RAM)
+  # blueprint_id: ubuntu_22_04  # Uncomment to override. Default: ubuntu_22_04
+
+  # Optional: Lightsail bucket for file storage
+  bucket:
+    enabled: false
+    name: my-docker-app-bucket
+    access_level: read_write   # read_only | read_write
+    bundle_id: small_1_0       # small_1_0 (250GB) | medium_1_0 (500GB) | large_1_0 (1TB)
+
+application:
+  name: my-docker-app
+  version: "1.0.0"
+  type: docker
+
+  # Files/directories to include in the deployment package.
+  # Paths are relative to the repo root.
+  package_files:
+    - "example-docker-app/"
+
+  # Environment variables injected into the .env file on the instance.
+  # These are passed to docker-compose via the .env file.
+  environment_variables:
+    APP_ENV: production
+    APP_DEBUG: "false"
+
+deployment:
+  docker_app_path: /opt/docker-app
+  docker_compose_file: docker-compose.yml
+
+  # Firewall ports to open on the Lightsail instance
+  firewall:
+    allowed_ports:
+      - 22    # SSH
+      - 80    # HTTP
+      - 443   # HTTPS
+
+monitoring:
+  health_check:
+    endpoint: "/"
+    expected_content: "OK"
+    max_attempts: 10
+    wait_between_attempts: 15
+    initial_wait: 60
